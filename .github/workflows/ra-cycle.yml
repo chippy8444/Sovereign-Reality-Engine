@@ -12,6 +12,9 @@ concurrency:
   group: ra-cycle-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   heartbeat:
     runs-on: ubuntu-latest
