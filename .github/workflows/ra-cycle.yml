@@ -1,0 +1,49 @@
+name: Resolution Assurance Autonomous Heartbeat
+
+on:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: ra-cycle-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  heartbeat:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Check server syntax
+        run: npm run check
+
+      - name: Smoke test server
+        shell: bash
+        run: |
+          node server.mjs > server.log 2>&1 &
+          server_pid=$!
+          trap 'kill $server_pid || true' EXIT
+          for i in {1..30}; do
+            if curl -fsS http://127.0.0.1:3030/api/status >/tmp/status.json; then
+              cat /tmp/status.json
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Server did not become ready"
+          cat server.log
+          exit 1
