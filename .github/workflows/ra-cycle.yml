@@ -13,20 +13,52 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   heartbeat:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - name: Checkout repository without JavaScript actions
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          branch="${GITHUB_REF_NAME:-main}"
+          repo_url="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git init .
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git remote remove origin 2>/dev/null || true
+          git remote add origin "$repo_url"
+          for attempt in 1 2 3 4 5; do
+            if git fetch --no-tags --prune --depth=1 origin "+refs/heads/${branch}:refs/remotes/origin/${branch}"; then
+              git checkout -B "$branch" "origin/$branch"
+              git log -1 --oneline
+              exit 0
+            fi
+            sleep $((attempt * 10))
+          done
+          curl -fsSL \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -L "https://api.github.com/repos/${GITHUB_REPOSITORY}/tarball/${branch}" \
+            -o repo.tar.gz
+          mkdir repo_extract
+          tar -xzf repo.tar.gz -C repo_extract --strip-components=1
+          shopt -s dotglob
+          cp -a repo_extract/* .
+          rm -rf repo_extract repo.tar.gz
+          git init .
+          git remote remove origin 2>/dev/null || true
+          git remote add origin "$repo_url"
+          git checkout -B "$branch"
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: npm
+      - name: Verify Node runtime and syntax
+        run: |
+          set -euo pipefail
+          node --version
+          node --check server.mjs
+          node --check scripts/export_ra_edges.mjs
 
       - name: Install dependencies
         run: npm install
@@ -37,6 +69,7 @@ jobs:
       - name: Smoke test server
         shell: bash
         run: |
+          set -euo pipefail
           node server.mjs > server.log 2>&1 &
           server_pid=$!
           trap 'kill $server_pid || true' EXIT
@@ -50,3 +83,23 @@ jobs:
           echo "Server did not become ready"
           cat server.log
           exit 1
+
+      - name: Export public-safe edge packets for canonical RA graph
+        run: |
+          set -euo pipefail
+          node scripts/export_ra_edges.mjs
+
+      - name: Commit SRE edge export packets
+        run: |
+          set -euo pipefail
+          branch="${GITHUB_REF_NAME:-main}"
+          git config user.name "ra-sre-bot"
+          git config user.email "ra-sre-bot@users.noreply.github.com"
+          git add data/ra-edge-exports || true
+          if git diff --cached --quiet; then
+            echo "No SRE edge export changes to commit."
+          else
+            git commit -m "chore(graph): export SRE witness edge packets"
+            git pull --rebase origin "$branch" || true
+            git push origin "HEAD:$branch"
+          fi
