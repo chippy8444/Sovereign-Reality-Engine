@@ -15,6 +15,19 @@ const LOG_DIR = path.join(DATA_ROOT, 'logs');
 const DEFAULT_DRIVE_ROOTS = fs.existsSync('D:/') ? ['C:/', 'D:/'] : ['C:/'];
 const READABLE_TEXT_EXTENSIONS = new Set(['.txt', '.md', '.markdown', '.json', '.jsonl', '.csv', '.ts', '.tsx', '.js', '.jsx', '.mjs', '.py', '.html', '.htm', '.xml', '.yml', '.yaml', '.log', '.sql', '.ps1', '.bat', '.ini', '.cfg', '.conf', '.toml', '.rtf', '.srt', '.vtt']);
 const DRIVE_SKIP_SEGMENTS = new Set(['node_modules', '.git', '$recycle.bin', 'system volume information', 'windows', 'program files', 'program files (x86)', 'programdata', 'temp', 'tmp', 'cache']);
+const DRIVE_PRIORITY_SEGMENTS = new Set(['chat', 'conversation', 'conversations', 'transcript', 'transcripts', 'log', 'logs', 'audit', 'report', 'reports', 'rating', 'score', 'codex', 'raw', 'dada', 'ledger', 'brain', 'training']);
+const DRIVE_NOISE_SEGMENTS = new Set(['inetcache', 'webcache', 'browser cache', 'service worker', 'code cache', 'crashpad', 'temporary internet files', 'appdata/local/packages/microsoft.windows.cloudexperiencehost']);
+const SKILL_REGISTRY = Object.freeze([
+  { id: 'audit', label: 'Audit', summary: 'Finds audit, report, rating, score, codex, raw, dada, and ledger files, then returns findings with local evidence.' },
+  { id: 'files', label: 'File Search', summary: 'Searches local files on C: and D: and returns the strongest evidence matches.' },
+  { id: 'inventory', label: 'Inventory', summary: 'Summarizes what the local workspace, graph, and runtime can currently see.' },
+  { id: 'training', label: 'Training', summary: 'Turns verified turns, uploads, and examples into structured learning rows.' },
+  { id: 'capability', label: 'Capability Check', summary: 'Explains what the local bot can do offline and when web fallback is used.' },
+  { id: 'guidance', label: 'Guidance', summary: 'Explains next steps and operating procedures from local evidence.' },
+  { id: 'skills', label: 'Skill List', summary: 'Lists the skills the local bot currently recognizes.' },
+  { id: 'greeting', label: 'Greeting', summary: 'Handles hello/hi style greetings.' },
+  { id: 'general', label: 'General', summary: 'Falls back to the strongest local evidence available.' }
+]);
 fs.mkdirSync(PRIVATE_DIR, { recursive: true });
 fs.mkdirSync(LOG_DIR, { recursive: true });
 
@@ -62,7 +75,42 @@ function isReadableTextPath(filePath) { return READABLE_TEXT_EXTENSIONS.has(path
 function shouldSkipDrivePath(filePath) { const normalized = String(filePath || '').replace(/\\/g, '/').toLowerCase(); return [...DRIVE_SKIP_SEGMENTS].some((segment) => normalized.includes(`/${segment}/`) || normalized.endsWith(`/${segment}`) || normalized.includes(`/${segment}.`) || normalized.startsWith(`${segment}/`)); }
 function cleanSearchSnippet(text, maxLength = 240) { return safeText(text).replace(/\s+/g, ' ').trim().slice(0, maxLength); }
 function buildDriveEvidence(filePath, lineNo, lineContent, score, terms) { const now = new Date().toISOString(); const snippet = cleanSearchSnippet(lineContent, 280); return { id: buildEvidenceId('DRV', `${filePath}:${lineNo}:${snippet}`), claim: snippet || filePath, tags: ['local-drive', 'readable-text'], status: 'clean', source: 'drive', path: filePath, mime: 'text/plain', score, snippet, uploadedAt: now, scan: { status: 'clean', safe: true, reviewedAt: now, name: path.basename(filePath), mime: 'text/plain', source: 'drive', issues: [], terms: Array.isArray(terms) ? terms : [] } }; }
-function shouldPreferWeb(query) { return /(search the web|according to the web|according to public|publicly|latest|current|today|news|live update|real[- ]time|web signals|internet|online)/i.test(String(query || '')); }
+function isCapabilityQuestion(query) { return /\b(operational|operate|operating|capable|capabilities|full capabilities|offline|online|browser|github ingestion|ingestion failed|exact model|cost[- ]effective|cost effectiveness|why can't you get operational|why cant you get operational|working alone)\b/i.test(String(query || '')); }
+function shouldPreferWeb(query) { return !isCapabilityQuestion(query) && /(search the web|according to the web|according to public|publicly|latest|current|today|news|live update|real[- ]time|web signals|internet)/i.test(String(query || '')); }
+function isChatCorpusQuery(query) { return /\b(chat|chatlog|chat log|conversation|transcript|transcripts|audit|report|rating|score|codex|raw|dada|ledger)\b/i.test(String(query || '')); }
+function getSkillProfile(skillId) { return SKILL_REGISTRY.find((skill) => skill.id === skillId) || SKILL_REGISTRY.find((skill) => skill.id === 'general'); }
+function detectSkill(question) {
+  const q = String(question || '').toLowerCase();
+  if (/\b(audit|auditing|forensic|forensics|report|rating|score|codex|raw|dada|waste tax|ledger|metrics?)\b/.test(q)) return getSkillProfile('audit');
+  if (/\b(can you work in(?: my)? files?|work in(?: my)? files?|work with(?: my)? files?|read(?: my)? files?|use(?: my)? files?|open(?: my)? files?|work from files|local files|local drive|drive c|drive d|files on c|files on d|c:|d:|my files|my documents|upload a file|attach a file)\b/.test(q)) return getSkillProfile('files');
+  if (/\b(what can you see|what do you have|show me what you found|what evidence|what files|inventory|what's in the workspace)\b/.test(q)) return getSkillProfile('inventory');
+  if (/\b(how do i|how can i|what should i do|next step|how does this work|workflow|process)\b/.test(q)) return getSkillProfile('guidance');
+  if (/\b(learn|training|train|ingest|lesson|lessons)\b/.test(q)) return getSkillProfile('training');
+  if (isCapabilityQuestion(q)) return getSkillProfile('capability');
+  if (/\b(skills?|skill list|what skills|available skills)\b/.test(q)) return getSkillProfile('skills');
+  if (/\b(hi|hello|hey|g'day|good morning|good afternoon|good evening)\b/.test(q)) return getSkillProfile('greeting');
+  return getSkillProfile('general');
+}
+function scoreDrivePath(filePath, queryTerms = []) {
+  const normalized = String(filePath || '').replace(/\\/g, '/').toLowerCase();
+  let bonus = 0;
+  let penalty = 0;
+  for (const segment of DRIVE_PRIORITY_SEGMENTS) {
+    if (normalized.includes(segment)) bonus += 1;
+  }
+  for (const segment of DRIVE_NOISE_SEGMENTS) {
+    if (normalized.includes(segment)) penalty += 2;
+  }
+  if (isChatCorpusQuery(queryTerms.join(' '))) {
+    for (const segment of ['chat', 'conversation', 'transcript', 'log', 'audit', 'report', 'rating', 'score', 'codex', 'raw', 'dada', 'ledger', 'training']) {
+      if (normalized.includes(segment)) bonus += 2;
+    }
+  }
+  if (normalized.includes('/raw_chat_logs/') || normalized.includes('/chat_logs/') || normalized.includes('/transcripts/') || normalized.includes('/conversations/')) {
+    bonus += 3;
+  }
+  return bonus - penalty;
+}
 function buildSystemEvidence() {
   const now = new Date().toISOString();
   const settings = getSettings();
@@ -382,7 +430,8 @@ function writeTrainingSnapshot(reason = 'interval') {
       answerHash: item.answerHash,
       verification: item.verification?.status || item.verification,
       sourceMode: item.sourceMode,
-      intent: item.intent
+      intent: item.intent,
+      skill: item.skillId || item.skill || null
     }))
   };
   appendJsonl(trainingSnapshotFile, snapshot);
@@ -390,7 +439,7 @@ function writeTrainingSnapshot(reason = 'interval') {
   return snapshot;
 }
 
-function promoteInteractionToGraph({ question, answer, verification, evidence, sourceMode, intent, ts }) {
+function promoteInteractionToGraph({ question, answer, verification, evidence, sourceMode, intent, skill, ts }) {
   if (!verification || verification.status !== 'Verified') return null;
   const questionHash = sha256(question);
   const answerHash = sha256(answer);
@@ -400,7 +449,7 @@ function promoteInteractionToGraph({ question, answer, verification, evidence, s
     id: nodeId,
     claim: `Verified local interaction: ${safeText(question).slice(0, 120)} -> ${safeText(answer).slice(0, 160)}`,
     summary: safeText(answer).slice(0, 400),
-    tags: ['chat-turn', 'training', 'verified', intent, sourceMode].filter(Boolean),
+    tags: ['chat-turn', 'training', 'verified', intent, skill?.id || skill, sourceMode].filter(Boolean),
     status: 'rooted',
     knowledge_layer: 'verified_learning',
     trust_status: 'trusted',
@@ -410,6 +459,7 @@ function promoteInteractionToGraph({ question, answer, verification, evidence, s
     answerHash,
     evidenceIds: (evidence || []).map((item) => item.id).filter(Boolean),
     sourceMode,
+    skillId: skill?.id || skill || null,
     verification: verification.status,
     grade: verification.grade,
     createdAt: ts
@@ -421,11 +471,11 @@ function promoteInteractionToGraph({ question, answer, verification, evidence, s
   return node;
 }
 
-function recordTrainingInteraction({ question, answer, verification, evidence, sourceMode, intent, trace }) {
+function recordTrainingInteraction({ question, answer, verification, evidence, sourceMode, intent, trace, skill }) {
   const ts = new Date().toISOString();
   const questionHash = sha256(question);
   const answerHash = sha256(answer);
-  const promotedNode = promoteInteractionToGraph({ question, answer, verification, evidence, sourceMode, intent, ts });
+  const promotedNode = promoteInteractionToGraph({ question, answer, verification, evidence, sourceMode, intent, skill, ts });
   const entry = {
     ts,
     kind: 'chat_turn',
@@ -433,6 +483,7 @@ function recordTrainingInteraction({ question, answer, verification, evidence, s
     answerHash,
     intent,
     sourceMode,
+    skillId: skill?.id || null,
     evidenceIds: (evidence || []).map((item) => item.id).filter(Boolean),
     evidenceCount: Array.isArray(evidence) ? evidence.length : 0,
     knowledgeLayer: verification?.status === 'Verified' ? 'real_evidence' : 'synthetic_gap_fill',
@@ -500,14 +551,18 @@ function searchDriveEvidence(query, limit = 8) {
     if (shouldSkipDrivePath(filePath) || !isReadableTextPath(filePath)) continue;
     const haystack = `${filePath} ${content}`.toLowerCase();
     const score = terms.reduce((count, term) => count + (haystack.includes(term) ? 1 : 0), 0);
-    if (!score) continue;
-    const evidence = buildDriveEvidence(filePath, lineNo, content, score, terms);
+    const pathScore = scoreDrivePath(filePath, terms);
+    const totalScore = score + pathScore;
+    if (!totalScore) continue;
+    const evidence = buildDriveEvidence(filePath, lineNo, content, totalScore, terms);
     const current = byPath.get(filePath);
-    if (!current || evidence.score > current.score) {
+    if (!current || (evidence.score || 0) > (current.score || 0)) {
       byPath.set(filePath, evidence);
     }
   }
-  return [...byPath.values()].sort((a, b) => (b.score || 0) - (a.score || 0) || String(b.uploadedAt || '').localeCompare(String(a.uploadedAt || ''))).slice(0, limit);
+  return [...byPath.values()]
+    .sort((a, b) => (b.score || 0) - (a.score || 0) || String(b.uploadedAt || '').localeCompare(String(a.uploadedAt || '')))
+    .slice(0, limit);
 }
 
 function parseDuckDuckGoLiteMarkdown(markdown, query, limit = 5) {
@@ -565,33 +620,62 @@ async function searchKnowledge(query, limit = 8) {
   const settings = getSettings();
   const minLocalScore = Number(settings.localEvidenceThreshold || 3);
   const preferWeb = shouldPreferWeb(query);
+  const intent = classifyQuestionIntent(query);
+  const systemEvidence = buildSystemEvidence();
   if (preferWeb) {
     const webFirst = await searchWebSignals(query, limit);
     if (webFirst.length) return { evidence: webFirst, mode: 'web-signals' };
   }
-  const intent = classifyQuestionIntent(query);
-  if (['greeting', 'files', 'inventory', 'guidance'].includes(intent)) {
-    return { evidence: buildSystemEvidence(), mode: 'intent-direct' };
+  if (intent === 'greeting') {
+    return { evidence: systemEvidence, mode: 'intent-direct' };
+  }
+  if (intent === 'capability') {
+    return { evidence: systemEvidence, mode: 'intent-direct' };
+  }
+  if (intent === 'skills') {
+    return { evidence: systemEvidence, mode: 'intent-direct' };
   }
   const uploaded = scoreDocuments(query, limit);
-  if (uploaded.length && Math.max(...uploaded.map((item) => Number(item.score || 0))) >= minLocalScore) return { evidence: uploaded, mode: 'uploaded-documents' };
   const drive = searchDriveEvidence(query, limit);
-  if (drive.length && Math.max(...drive.map((item) => Number(item.score || 0))) >= minLocalScore) return { evidence: drive, mode: 'local-drives' };
   const graph = searchGraph(query, limit);
+  const localCandidates = [...uploaded, ...drive, ...graph].reduce((acc, item) => {
+    const key = String(item?.id || item?.path || item?.claim || '');
+    if (!key || acc.seen.has(key)) return acc;
+    acc.seen.add(key);
+    acc.items.push(item);
+    return acc;
+  }, { seen: new Set(), items: [] }).items.sort((a, b) => (b.score || 0) - (a.score || 0) || String(b.uploadedAt || '').localeCompare(String(a.uploadedAt || '')));
+
+  if (['files', 'inventory', 'guidance', 'audit', 'training'].includes(intent)) {
+    if (localCandidates.length) {
+      return {
+        evidence: localCandidates.slice(0, limit),
+        mode: drive.length ? 'local-drives' : uploaded.length ? 'uploaded-documents' : 'seed-graph'
+      };
+    }
+    return { evidence: systemEvidence, mode: 'intent-direct' };
+  }
+
+  if (uploaded.length && Math.max(...uploaded.map((item) => Number(item.score || 0))) >= minLocalScore) return { evidence: uploaded, mode: 'uploaded-documents' };
+  if (drive.length && Math.max(...drive.map((item) => Number(item.score || 0))) >= minLocalScore) return { evidence: drive, mode: 'local-drives' };
   if (graph.length && Math.max(...graph.map((item) => Number(item.score || 0))) >= Math.max(2, minLocalScore - 1)) return { evidence: graph, mode: 'seed-graph' };
   const web = await searchWebSignals(query, limit);
   if (web.length) return { evidence: web, mode: 'web-signals' };
   if (drive.length) return { evidence: drive, mode: 'local-drives' };
   if (graph.length) return { evidence: graph, mode: 'seed-graph' };
-  return { evidence: [], mode: 'no-match' };
+  return { evidence: systemEvidence, mode: 'intent-direct' };
 }
 
 function refine(question, draft, evidence, sourceMode = 'local', intent = 'general') {
-  const text = `${question} ${draft}`;
+  const draftText = String(draft || '');
+  const answerMarker = '\n\nAnswer:\n';
+  const markerIndex = draftText.lastIndexOf(answerMarker);
+  const directAnswer = markerIndex >= 0 ? draftText.slice(markerIndex + answerMarker.length).trim() : draftText.trim();
+  const text = `${question} ${directAnswer}`;
   const highImpact = /value|valuation|breach|legal|refund|compensation|robot|dose|cut|heat|lift|transport|completed|done|fixed|sealed|wired|located|tested/i.test(text);
-  const completionClaim = /\b(done|completed|fixed|sealed|wired|tested|fully operational)\b/i.test(draft);
+  const completionClaim = /\b(done|completed|fixed|sealed|wired|tested|fully operational)\b/i.test(directAnswer);
   let status = 'Not Verified'; let grade = 'F';
-  const directIntent = ['greeting', 'files', 'inventory', 'guidance'].includes(intent);
+  const directIntent = ['greeting', 'files', 'inventory', 'guidance', 'audit', 'skills', 'training', 'capability'].includes(intent);
   const hasEvidence = Array.isArray(evidence) && evidence.length > 0;
   if (!completionClaim && directIntent && hasEvidence) { status = 'Verified'; grade = 'A'; }
   else if (!completionClaim && sourceMode === 'web-signals' && hasEvidence) { status = 'Verified'; grade = 'A'; }
@@ -603,12 +687,7 @@ function refine(question, draft, evidence, sourceMode = 'local', intent = 'gener
 }
 
 function classifyQuestionIntent(question) {
-  const q = String(question || '').toLowerCase();
-  if (/\b(hi|hello|hey|g'day|good morning|good afternoon|good evening)\b/.test(q)) return 'greeting';
-  if (/\b(can you work in(?: my)? files?|work in(?: my)? files?|work with(?: my)? files?|read(?: my)? files?|use(?: my)? files?|open(?: my)? files?|work from files|local files|local drive|drive c|drive d|files on c|files on d|c:|d:|my files|my documents|upload a file|attach a file)\b/.test(q)) return 'files';
-  if (/\b(what can you see|what do you have|show me what you found|what evidence|what files)\b/.test(q)) return 'inventory';
-  if (/\b(how do i|how can i|what should i do|next step)\b/.test(q)) return 'guidance';
-  return 'general';
+  return detectSkill(question).id;
 }
 
 function formatEvidenceLines(evidence, limit = 3) {
@@ -623,6 +702,8 @@ function formatEvidenceLines(evidence, limit = 3) {
 
 function localAnswer(question, evidence, reason = '', sourceMode = 'local') {
   const intent = classifyQuestionIntent(question);
+  const corpusQuery = isChatCorpusQuery(question);
+  const skill = detectSkill(question);
   const evidenceText = formatEvidenceLines(evidence, 3);
   const firstEvidence = Array.isArray(evidence) && evidence.length ? evidence[0] : null;
   const firstLabel = firstEvidence?.path || firstEvidence?.name || firstEvidence?.id || null;
@@ -640,16 +721,33 @@ function localAnswer(question, evidence, reason = '', sourceMode = 'local') {
   let answer;
   if (intent === 'greeting') {
     answer = 'Hello - yes, the local engine is live and can work from uploaded files on C: and D:.';
+  } else if (intent === 'skills') {
+    answer = `Available skills: ${SKILL_REGISTRY.filter((item) => item.id !== 'general').map((item) => `${item.label} (${item.id})`).join(', ')}.`;
+  } else if (intent === 'audit') {
+    const topFiles = Array.isArray(evidence) ? evidence.slice(0, 5).map((item, idx) => {
+      const label = item?.path || item?.name || item?.id || `evidence-${idx + 1}`;
+      const snippet = String(item?.snippet || item?.claim || '').replace(/\s+/g, ' ').trim();
+      return `${idx + 1}. ${label}${snippet ? ` — ${snippet}` : ''}`;
+    }) : [];
+    answer = `I used the Audit skill and searched for audit-style files, reports, ratings, scores, Codex/raw/Dada logs, and ledgers across your local drives.\n\nI found ${Array.isArray(evidence) ? evidence.length : 0} matching local files.\n${topFiles.length ? `Top matches:\n${topFiles.join('\n')}\n\n` : ''}This is the right lane for building your Resolution Assurance audit and waste-tax template. If you want, I can now turn these hits into a structured file-by-file audit table with metrics, findings, and template fields.`;
   } else if (intent === 'files') {
-    answer = 'Yes - I can work from your local files on C: and D:, and I can fall back to web signals when local evidence is thin.';
+    answer = corpusQuery
+      ? 'Yes - I can work from your local files on C: and D:, and for chat-log searches I will keep the search local first, rank the strongest matches, and only fall back to web signals if the local evidence is thin.'
+      : 'Yes - I can work from your local files on C: and D:, and I can fall back to web signals when local evidence is thin.';
   } else if (intent === 'inventory') {
     answer = `I can see the local runtime, the configured storage roots, and ${Array.isArray(evidence) ? evidence.length : 0} supporting runtime facts.`;
+  } else if (intent === 'capability') {
+    const provider = getSettings().providerLabel || 'Local drives + web fallback';
+    const driveRoots = Array.isArray(getSettings().driveRoots) ? getSettings().driveRoots.join(', ') : 'C:/, D:/';
+    answer = `The system is operational locally, but it is not yet the exact fully-tuned model you described. Right now it runs local file search, local graph search, verified training logging, and optional web fallback. The GitHub ingestion error you are seeing is a stale dashboard status, not the local bot itself. Offline usage works for local files and the graph; online lookup works only when web fallback is enabled. The current provider is ${provider}, and the local drive roots are ${driveRoots}.`;
   } else if (sourceMode === 'web-signals' && firstLabel) {
     answer = `I could not resolve that locally, so I checked web signals. The strongest result is ${firstLabel}.`;
     if (firstSnippet) answer += ` ${firstSnippet}`;
     answer += ' If you want, I can keep narrowing it against the local files too.';
   } else if (sourceMode === 'local-drives' && firstLabel) {
-    answer = `I searched readable files on C: and D:, and the best match is ${firstLabel}.`;
+    answer = corpusQuery
+      ? `I searched readable files on C: and D: for chat-log style files and keyword hits, and found ${Array.isArray(evidence) ? evidence.length : 0} matches. The strongest match is ${firstLabel}.`
+      : `I searched readable files on C: and D:, and the best match is ${firstLabel}.`;
     if (firstSnippet) answer += ` ${firstSnippet}`;
     answer += ' If that is not the file you meant, point me at the exact document and I will read from that instead of guessing.';
   } else if (firstSnippet) {
@@ -695,11 +793,12 @@ app.get('/api/status', (req, res) => {
     : settings.allowWebFallback === false
       ? 'Local evidence fallback'
       : 'Local drives + web fallback';
-  res.json({ ok: true, app: 'Resolution AI / Sovereign Reality Engine', version: '0.3.1-blue-no-cache', port: PORT, provider, dataRoot: DATA_ROOT, documents: loadReadableDocuments().length, training: readTrainingSummary(), settings });
+  res.json({ ok: true, app: 'Resolution AI / Sovereign Reality Engine', version: '0.3.1-blue-no-cache', port: PORT, provider, dataRoot: DATA_ROOT, documents: loadReadableDocuments().length, skills: SKILL_REGISTRY, training: readTrainingSummary(), settings });
 });
 app.get('/api/settings', (req, res) => res.json(getSettings()));
+app.get('/api/skills', (req, res) => res.json({ ok: true, skills: SKILL_REGISTRY, current: detectSkill(String(req.query.q || '')).id }));
 app.post('/api/settings', (req, res) => { const next = { ...getSettings(), ...(req.body || {}) }; writeJson(settingsFile, next); const normalized = getSettings(); writeJson(settingsFile, normalized); const aud = audit({ type: 'settings_update', settingsHash: sha256(JSON.stringify(normalized)) }); updateTrainingSummary({ kind: 'settings', ts: new Date().toISOString() }); res.json({ ok: true, settings: normalized, audit: aud.hash }); });
-app.post('/api/chat', async (req, res) => { const question = safeText(req.body?.message || req.body?.question).trim(); if (!question) return res.status(400).json({ error: 'message required' }); const trace = [{ step: 'classify', status: 'ok' }]; const intent = classifyQuestionIntent(question); const search = await searchKnowledge(question, getSettings().maxGraphNodes || 8); const evidence = search.evidence || []; trace.push({ step: 'knowledge', status: 'ok', count: evidence.length, mode: search.mode, intent }); const draft = await draftAnswer(question, evidence, search.mode); trace.push({ step: 'model', status: (process.env.ANTHROPIC_API_KEY || process.env.CLAUDE_API_KEY) && getSettings().provider === 'anthropic' ? 'anthropic' : search.mode === 'web-signals' ? 'web_fallback' : 'local_fallback' }); const verification = refine(question, draft, evidence, search.mode, intent); trace.push({ step: 'ra_refinery', status: verification.status, grade: verification.grade }); const aud = audit({ type: 'chat', questionHash: sha256(question), verification, evidenceIds: verification.evidenceIds, sourceMode: search.mode }); recordTrainingInteraction({ question, answer: draft, verification, evidence, sourceMode: search.mode, intent, trace }); res.json({ answer: draft, verification, trace, audit: { id: aud.hash, prevHash: aud.prevHash }, evidence, sourceMode: search.mode, intent }); });
+app.post('/api/chat', async (req, res) => { const question = safeText(req.body?.message || req.body?.question).trim(); if (!question) return res.status(400).json({ error: 'message required' }); const trace = [{ step: 'classify', status: 'ok' }]; const skill = detectSkill(question); const intent = skill.id; const search = await searchKnowledge(question, getSettings().maxGraphNodes || 8); const evidence = search.evidence || []; trace.push({ step: 'knowledge', status: 'ok', count: evidence.length, mode: search.mode, intent, skill: skill.id }); const draft = await draftAnswer(question, evidence, search.mode); trace.push({ step: 'model', status: (process.env.ANTHROPIC_API_KEY || process.env.CLAUDE_API_KEY) && getSettings().provider === 'anthropic' ? 'anthropic' : search.mode === 'web-signals' ? 'web_fallback' : 'local_fallback', skill: skill.id }); const verification = refine(question, draft, evidence, search.mode, intent); trace.push({ step: 'ra_refinery', status: verification.status, grade: verification.grade, skill: skill.id }); const aud = audit({ type: 'chat', questionHash: sha256(question), verification, evidenceIds: verification.evidenceIds, sourceMode: search.mode, skill: skill.id }); recordTrainingInteraction({ question, answer: draft, verification, evidence, sourceMode: search.mode, intent, trace, skill }); res.json({ answer: draft, verification, trace, audit: { id: aud.hash, prevHash: aud.prevHash }, evidence, sourceMode: search.mode, intent, skill, skills: SKILL_REGISTRY }); });
 app.get('/api/graph/search', (req, res) => res.json({ results: searchKnowledge(String(req.query.q || ''), Number(req.query.limit || 20)) }));
 app.post('/api/graph/anchor', (req, res) => { const graph = getGraph(); const node = { id: req.body?.id || `NODE-${Date.now()}`, claim: safeText(req.body?.claim), tags: req.body?.tags || [], status: 'rooted', createdAt: new Date().toISOString() }; graph.push(node); writeJson(graphFile, graph); const aud = audit({ type: 'graph_anchor', nodeId: node.id, claimHash: sha256(node.claim) }); res.json({ node, audit: aud.hash }); });
 app.get('/api/training', (req, res) => {
