@@ -20,7 +20,7 @@
     <button class="navbtn" onclick="showPanel('settings',this); loadSettings()">Settings</button>
     <button class="navbtn" onclick="testProvider()">Test Provider</button>
     <button class="navbtn" onclick="clearCacheReload()">Force Blue Reload</button>
-    <div class="side-status" id="sideStatus"><b>Privacy:</b> local-first storage.<br><b>Provider:</b> local evidence fallback by default.<br><b>Rule:</b> answer + badge.</div>
+    <div class="side-status" id="sideStatus"><b>Privacy:</b> local-first storage.<br><b>Provider:</b> local drives + web fallback by default.<br><b>Rule:</b> answer + badge.</div>
   </aside>
   <main class="main">
     <header class="top"><b id="title">Resolution AI</b><span class="provider" id="status">Checking…</span></header>
@@ -41,7 +41,7 @@ const messages=document.getElementById('messages'), input=document.getElementByI
 function $(id){return document.getElementById(id)}
 input.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send();}});input.addEventListener('input',()=>{input.style.height='auto';input.style.height=Math.min(input.scrollHeight,88)+'px'});
 async function api(url,opts){const r=await fetch(url,{cache:'no-store',...opts});if(!r.ok)throw new Error(url+' '+r.status);return await (r.headers.get('content-type')||'').includes('json')?r.json():r.text()}
-async function status(){try{const j=await api('/api/status');$('status').textContent=j.provider+' · '+j.dataRoot;$('sideStatus').innerHTML='<b>Provider:</b> '+j.provider+'<br><b>Storage:</b> '+j.dataRoot+'<br><b>Version:</b> '+j.version}catch(e){$('status').textContent='server offline';$('sideStatus').textContent='Server offline'}}status();
+async function status(){try{const j=await api('/api/status');$('status').textContent=j.provider+' · '+j.dataRoot;$('sideStatus').innerHTML='<b>Provider:</b> '+j.provider+'<br><b>Storage:</b> '+j.dataRoot+'<br><b>Version:</b> '+j.version+'<br><b>Scope:</b> readable local files on C: and D:, then web signals if needed'}catch(e){$('status').textContent='server offline';$('sideStatus').textContent='Server offline'}}status();
 function showPanel(name,btn){document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));document.querySelectorAll('.navbtn').forEach(b=>b.classList.remove('active'));$(name+'Panel').classList.add('active');if(btn)btn.classList.add('active');$('title').textContent=name==='chat'?'Resolution AI':name[0].toUpperCase()+name.slice(1)}
 function clearCacheReload(){location.href='/?v='+Date.now()}
 function add(role,text,ver,trace){if(first){messages.innerHTML='';first=false}const wrap=document.createElement('div');wrap.className='msg '+(role==='you'?'you':'ai');const av=document.createElement('div');av.className='avatar '+(role==='you'?'you':'ai');av.textContent=role==='you'?'Y':'RA';const bub=document.createElement('div');bub.className='bubble';if(ver){const b=document.createElement('div');let cls=ver.status==='Verified'?'verified':ver.status==='Partially Verified'?'partial':'not';b.className='badge '+cls;b.textContent=ver.status+' · '+ver.grade;bub.appendChild(b)}const body=document.createElement('div');body.textContent=text;bub.appendChild(body);if(trace){const t=document.createElement('div');t.className='trace';t.textContent='Working: '+trace.map(x=>x.step+': '+x.status).join(' → ');bub.appendChild(t)}wrap.appendChild(av);wrap.appendChild(bub);messages.appendChild(wrap);messages.closest('.chat').scrollTop=messages.closest('.chat').scrollHeight}
