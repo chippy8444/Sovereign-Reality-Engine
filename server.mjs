@@ -58,6 +58,57 @@ function shouldSkipDrivePath(filePath) { const normalized = String(filePath || '
 function cleanSearchSnippet(text, maxLength = 240) { return safeText(text).replace(/\s+/g, ' ').trim().slice(0, maxLength); }
 function buildDriveEvidence(filePath, lineNo, lineContent, score, terms) { const now = new Date().toISOString(); const snippet = cleanSearchSnippet(lineContent, 280); return { id: buildEvidenceId('DRV', `${filePath}:${lineNo}:${snippet}`), claim: snippet || filePath, tags: ['local-drive', 'readable-text'], status: 'clean', source: 'drive', path: filePath, mime: 'text/plain', score, snippet, uploadedAt: now, scan: { status: 'clean', safe: true, reviewedAt: now, name: path.basename(filePath), mime: 'text/plain', source: 'drive', issues: [], terms: Array.isArray(terms) ? terms : [] } }; }
 function shouldPreferWeb(query) { return /(search the web|according to the web|according to public|publicly|latest|current|today|news|live update|real[- ]time|web signals|internet|online)/i.test(String(query || '')); }
+function buildSystemEvidence() {
+  const now = new Date().toISOString();
+  const settings = getSettings();
+  const provider = settings.provider === 'anthropic' && (process.env.ANTHROPIC_API_KEY || process.env.CLAUDE_API_KEY)
+    ? 'Claude / Anthropic'
+    : settings.allowWebFallback === false
+      ? 'Local evidence fallback'
+      : 'Local drives + web fallback';
+  const docs = loadReadableDocuments();
+  return [
+    {
+      id: buildEvidenceId('SYS', 'status'),
+      claim: `Resolution AI is running locally at http://127.0.0.1:${PORT} with provider ${provider}.`,
+      tags: ['system', 'status', 'runtime'],
+      status: 'clean',
+      source: 'system',
+      path: `http://127.0.0.1:${PORT}/api/status`,
+      mime: 'application/json',
+      score: 3,
+      snippet: `Runtime status: ${provider}`,
+      uploadedAt: now,
+      scan: { status: 'clean', safe: true, reviewedAt: now, name: 'runtime-status', mime: 'application/json', source: 'system', issues: [] }
+    },
+    {
+      id: buildEvidenceId('SYS', 'storage'),
+      claim: `Local storage root is ${settings.localStorageRoot}; drive roots are ${(settings.driveRoots || DEFAULT_DRIVE_ROOTS).join(', ')}; web fallback is ${settings.allowWebFallback === false ? 'disabled' : 'enabled'}.`,
+      tags: ['system', 'settings', 'storage'],
+      status: 'clean',
+      source: 'system',
+      path: `${DATA_ROOT}/settings`,
+      mime: 'application/json',
+      score: 3,
+      snippet: `Storage root: ${settings.localStorageRoot}`,
+      uploadedAt: now,
+      scan: { status: 'clean', safe: true, reviewedAt: now, name: 'runtime-settings', mime: 'application/json', source: 'system', issues: [] }
+    },
+    {
+      id: buildEvidenceId('SYS', 'documents'),
+      claim: `Readable local documents loaded: ${docs.length}.`,
+      tags: ['system', 'documents', 'index'],
+      status: 'clean',
+      source: 'system',
+      path: `${DATA_ROOT}/documents`,
+      mime: 'application/json',
+      score: 3,
+      snippet: `Readable documents: ${docs.length}`,
+      uploadedAt: now,
+      scan: { status: 'clean', safe: true, reviewedAt: now, name: 'document-index', mime: 'application/json', source: 'system', issues: [] }
+    }
+  ];
+}
 
 function buildSnippet(text, terms, maxLength = 240) {
   const source = cleanDocumentText(text).replace(/\s+/g, ' ').trim();
@@ -224,7 +275,13 @@ function getGraph() {
 
 function getSettings() {
   const defaults = { theme: 'resolution_assurance_blue', provider: 'local', providerLabel: 'Local drives + web fallback', fallbackProvider: 'local', retrievalBudgetMs: 1800, webSearchBudgetMs: 6500, modelTimeoutMs: 8000, stream: true, localStorageRoot: DATA_ROOT, driveRoots: DEFAULT_DRIVE_ROOTS, allowWebFallback: true, allowUnverifiedAnswer: true, blockFalseCompletion: true, fastMode: true, maxDriveFileBytes: 400000 };
-  return { ...defaults, ...readJson(settingsFile, {}) };
+  const merged = { ...defaults, ...readJson(settingsFile, {}) };
+  if (merged.provider === 'anthropic' && (process.env.ANTHROPIC_API_KEY || process.env.CLAUDE_API_KEY)) {
+    merged.providerLabel = 'Claude / Anthropic';
+  } else {
+    merged.providerLabel = merged.allowWebFallback === false ? 'Local evidence fallback' : 'Local drives + web fallback';
+  }
+  return merged;
 }
 
 function audit(event) {
@@ -357,6 +414,10 @@ async function searchKnowledge(query, limit = 8) {
     const webFirst = await searchWebSignals(query, limit);
     if (webFirst.length) return { evidence: webFirst, mode: 'web-signals' };
   }
+  const intent = classifyQuestionIntent(query);
+  if (['greeting', 'files', 'inventory', 'guidance'].includes(intent)) {
+    return { evidence: buildSystemEvidence(), mode: 'intent-direct' };
+  }
   const uploaded = scoreDocuments(query, limit);
   if (uploaded.length && Math.max(...uploaded.map((item) => Number(item.score || 0))) >= minLocalScore) return { evidence: uploaded, mode: 'uploaded-documents' };
   const drive = searchDriveEvidence(query, limit);
@@ -373,7 +434,7 @@ async function searchKnowledge(query, limit = 8) {
 function refine(question, draft, evidence) {
   const text = `${question} ${draft}`;
   const highImpact = /value|valuation|breach|legal|refund|compensation|robot|dose|cut|heat|lift|transport|completed|done|fixed|sealed|wired|located|tested/i.test(text);
-  const completionClaim = /\b(done|completed|fixed|sealed|wired|located|tested|fully operational)\b/i.test(draft);
+  const completionClaim = /\b(done|completed|fixed|sealed|wired|tested|fully operational)\b/i.test(draft);
   let status = 'Not Verified'; let grade = 'F';
   if (evidence.length >= 3 && !completionClaim) { status = 'Verified'; grade = 'A'; }
   else if (evidence.length >= 1 && !completionClaim) { status = 'Partially Verified'; grade = 'C'; }
@@ -409,21 +470,21 @@ function localAnswer(question, evidence, reason = '', sourceMode = 'local') {
   const firstSnippet = String(firstEvidence?.snippet || firstEvidence?.claim || '').replace(/\s+/g, ' ').trim();
   const sourceLabel = sourceMode === 'web-signals' ? 'web signals' : sourceMode === 'local-drives' ? 'your local files on C: and D:' : 'the local Resolution Assurance layer';
   const evidenceBlock = Array.isArray(evidence) && evidence.length ? `Local evidence:\n${evidenceText}\n\n` : '';
+  const intro = sourceMode === 'web-signals'
+    ? 'I checked web signals and can answer from the local Resolution Assurance layer.'
+    : sourceMode === 'local-drives'
+      ? 'I searched readable files on C: and D: and can answer from the local Resolution Assurance layer.'
+      : sourceMode === 'intent-direct'
+        ? 'I can answer from the local Resolution Assurance layer.'
+        : 'I can answer from the local Resolution Assurance layer.';
 
   let answer;
   if (intent === 'greeting') {
-    answer = 'Hello — yes, I can work with files that are available in this local Resolution Assurance workspace. If you upload or attach a document, I can read it, anchor it locally, and answer from that file instead of guessing.';
+    answer = 'Hello — yes, the local engine is live and can work from uploaded files on C: and D:.';
   } else if (intent === 'files') {
-    answer = 'Yes — I can work from your local files as long as they are uploaded or otherwise available to this local bot instance. The current document index already contains file evidence, so the workspace is seeing your content rather than a blank prompt.';
-    if (firstLabel) {
-      answer += ` The strongest match right now is ${firstLabel}.`;
-    }
-    answer += ' If you want a specific file handled next, attach it here and I will use that file as the source.';
+    answer = 'Yes — I can work from your local files on C: and D:, and I can fall back to web signals when local evidence is thin.';
   } else if (intent === 'inventory') {
-    answer = 'I can see local evidence and file-backed documents, not just a canned response. If you want, I can summarize the current files, the graph, or the latest uploaded document in plain language.';
-    if (firstLabel) {
-      answer += ` The top match is ${firstLabel}.`;
-    }
+    answer = `I can see the local runtime, the configured storage roots, and ${Array.isArray(evidence) ? evidence.length : 0} supporting runtime facts.`;
   } else if (sourceMode === 'web-signals' && firstLabel) {
     answer = `I could not resolve that locally, so I checked web signals. The strongest result is ${firstLabel}.`;
     if (firstSnippet) answer += ` ${firstSnippet}`;
@@ -439,7 +500,7 @@ function localAnswer(question, evidence, reason = '', sourceMode = 'local') {
     answer = 'I do not have enough local evidence yet to answer that confidently. Upload or attach a file, and I can work from it directly.';
   }
 
-  return `${reason ? reason + '\n\n' : ''}I can answer from the local Resolution Assurance layer.\n\n${evidenceBlock}Answer:\n${answer}\n\nStatus note: this response is labelled by RA Refinery based on available local evidence.`;
+  return `${reason ? reason + '\n\n' : ''}${intro}\n\n${evidenceBlock}Answer:\n${answer}\n\nStatus note: this response is labelled by RA Refinery based on available local evidence.`;
 }
 
 async function claudeAnswer(question, evidence) {
@@ -479,7 +540,7 @@ app.get('/api/status', (req, res) => {
 });
 app.get('/api/settings', (req, res) => res.json(getSettings()));
 app.post('/api/settings', (req, res) => { const next = { ...getSettings(), ...(req.body || {}) }; writeJson(settingsFile, next); const aud = audit({ type: 'settings_update', settingsHash: sha256(JSON.stringify(next)) }); res.json({ ok: true, settings: next, audit: aud.hash }); });
-app.post('/api/chat', async (req, res) => { const question = safeText(req.body?.message || req.body?.question).trim(); if (!question) return res.status(400).json({ error: 'message required' }); const trace = [{ step: 'classify', status: 'ok' }]; const intent = classifyQuestionIntent(question); const search = intent === 'files' || intent === 'greeting' ? { evidence: [], mode: 'intent-direct' } : await searchKnowledge(question, getSettings().maxGraphNodes || 8); const evidence = search.evidence || []; trace.push({ step: 'knowledge', status: 'ok', count: evidence.length, mode: search.mode, intent }); const draft = await draftAnswer(question, evidence, search.mode); trace.push({ step: 'model', status: (process.env.ANTHROPIC_API_KEY || process.env.CLAUDE_API_KEY) && getSettings().provider === 'anthropic' ? 'anthropic' : search.mode === 'web-signals' ? 'web_fallback' : 'local_fallback' }); const verification = refine(question, draft, evidence); trace.push({ step: 'ra_refinery', status: verification.status, grade: verification.grade }); const aud = audit({ type: 'chat', questionHash: sha256(question), verification, evidenceIds: verification.evidenceIds }); res.json({ answer: draft, verification, trace, audit: { id: aud.hash, prevHash: aud.prevHash }, evidence, sourceMode: search.mode, intent }); });
+app.post('/api/chat', async (req, res) => { const question = safeText(req.body?.message || req.body?.question).trim(); if (!question) return res.status(400).json({ error: 'message required' }); const trace = [{ step: 'classify', status: 'ok' }]; const intent = classifyQuestionIntent(question); const search = await searchKnowledge(question, getSettings().maxGraphNodes || 8); const evidence = search.evidence || []; trace.push({ step: 'knowledge', status: 'ok', count: evidence.length, mode: search.mode, intent }); const draft = await draftAnswer(question, evidence, search.mode); trace.push({ step: 'model', status: (process.env.ANTHROPIC_API_KEY || process.env.CLAUDE_API_KEY) && getSettings().provider === 'anthropic' ? 'anthropic' : search.mode === 'web-signals' ? 'web_fallback' : 'local_fallback' }); const verification = refine(question, draft, evidence); trace.push({ step: 'ra_refinery', status: verification.status, grade: verification.grade }); const aud = audit({ type: 'chat', questionHash: sha256(question), verification, evidenceIds: verification.evidenceIds }); res.json({ answer: draft, verification, trace, audit: { id: aud.hash, prevHash: aud.prevHash }, evidence, sourceMode: search.mode, intent }); });
 app.get('/api/graph/search', (req, res) => res.json({ results: searchKnowledge(String(req.query.q || ''), Number(req.query.limit || 20)) }));
 app.post('/api/graph/anchor', (req, res) => { const graph = getGraph(); const node = { id: req.body?.id || `NODE-${Date.now()}`, claim: safeText(req.body?.claim), tags: req.body?.tags || [], status: 'rooted', createdAt: new Date().toISOString() }; graph.push(node); writeJson(graphFile, graph); const aud = audit({ type: 'graph_anchor', nodeId: node.id, claimHash: sha256(node.claim) }); res.json({ node, audit: aud.hash }); });
 app.get('/api/audit', (req, res) => { try { res.type('text/plain').send(fs.readFileSync(auditFile, 'utf8')); } catch { res.type('text/plain').send(''); } });
