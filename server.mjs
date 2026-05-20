@@ -35,6 +35,9 @@ app.use(express.static(path.join(__dirname, 'public'), { etag: false, maxAge: 0,
 
 const graphFile = path.join(PRIVATE_DIR, 'graph.json');
 const auditFile = path.join(LOG_DIR, 'sovereign_audit.jsonl');
+const trainingJournalFile = path.join(LOG_DIR, 'training_journal.jsonl');
+const trainingSummaryFile = path.join(LOG_DIR, 'training_summary.json');
+const trainingSnapshotFile = path.join(LOG_DIR, 'training_snapshots.jsonl');
 const documentsFile = path.join(PRIVATE_DIR, 'documents.json');
 const documentIndexFile = path.join(LOG_DIR, 'document_index.jsonl');
 const quarantineFile = path.join(LOG_DIR, 'quarantine.jsonl');
@@ -48,6 +51,8 @@ function writeJson(file, data) { fs.mkdirSync(path.dirname(file), { recursive: t
 function safeText(x) { return String(x || '').replace(/[\u0000-\u001f\u007f]/g, ' ').slice(0, 200000); }
 function cleanDocumentText(x) { return String(x || '').replace(/\u0000/g, '').slice(0, 400000); }
 function appendJsonl(file, data) { fs.mkdirSync(path.dirname(file), { recursive: true }); fs.appendFileSync(file, JSON.stringify(data) + '\n'); }
+function tailJsonl(file, limit = 20) { try { const lines = fs.readFileSync(file, 'utf8').trim().split(/\r?\n/).filter(Boolean); return lines.slice(-limit).map((line) => { try { return JSON.parse(line); } catch { return null; } }).filter(Boolean); } catch { return []; } }
+function countJsonl(file) { try { return fs.readFileSync(file, 'utf8').trim().split(/\r?\n/).filter(Boolean).length; } catch { return 0; } }
 function stripMarkdown(text) { return String(text || '').replace(/\*\*/g, '').replace(/\[(.*?)\]\((.*?)\)/g, '$1').replace(/[`*_>#]/g, '').replace(/\s+/g, ' ').trim(); }
 function tokenizeSearchTerms(question) { return String(question || '').toLowerCase().match(/[a-z0-9]{3,}/g)?.filter((term) => !['the', 'and', 'for', 'with', 'this', 'that', 'from', 'your', 'what', 'where', 'when', 'have', 'need', 'please', 'can', 'you', 'are', 'was', 'were', 'about', 'into', 'then', 'than', 'too', 'all', 'any', 'how', 'why', 'does', 'dont', 'still', 'only'].includes(term)) || []; }
 function normaliseDriveRoot(root) { const text = String(root || '').replace(/\\/g, '/').replace(/\/+$/, ''); return text ? (/[a-zA-Z]:$/.test(text) ? `${text}/` : text) : ''; }
@@ -293,6 +298,156 @@ function audit(event) {
   return record;
 }
 
+function readTrainingSummary() {
+  return readJson(trainingSummaryFile, {
+    updatedAt: null,
+    totalInteractions: 0,
+    verifiedInteractions: 0,
+    partialInteractions: 0,
+    unverifiedInteractions: 0,
+    promotedInteractions: 0,
+    candidateInteractions: 0,
+    uploadEvents: 0,
+    settingsEvents: 0,
+    snapshotCount: 0,
+    lastQuestionHash: null,
+    lastAnswerHash: null,
+    lastSourceMode: null,
+    lastVerification: null,
+    lastSnapshotAt: null,
+    recentInteractions: []
+  });
+}
+
+function writeTrainingSummary(summary) {
+  writeJson(trainingSummaryFile, summary);
+  return summary;
+}
+
+function updateTrainingSummary(event) {
+  const summary = readTrainingSummary();
+  summary.updatedAt = new Date().toISOString();
+  if (event?.kind === 'chat_turn') {
+    summary.totalInteractions += 1;
+    if (event.verification === 'Verified') summary.verifiedInteractions += 1;
+    else if (event.verification === 'Partially Verified') summary.partialInteractions += 1;
+    else summary.unverifiedInteractions += 1;
+    if (event.promotedToGraph) summary.promotedInteractions += 1;
+    else summary.candidateInteractions += 1;
+    summary.lastQuestionHash = event.questionHash || summary.lastQuestionHash;
+    summary.lastAnswerHash = event.answerHash || summary.lastAnswerHash;
+    summary.lastSourceMode = event.sourceMode || summary.lastSourceMode;
+    summary.lastVerification = event.verification || summary.lastVerification;
+    summary.recentInteractions = [
+      {
+        ts: event.ts,
+        questionHash: event.questionHash,
+        answerHash: event.answerHash,
+        verification: event.verification,
+        sourceMode: event.sourceMode,
+        intent: event.intent,
+        evidenceCount: event.evidenceCount,
+        promotedToGraph: Boolean(event.promotedToGraph)
+      },
+      ...summary.recentInteractions
+    ].slice(0, 20);
+  } else if (event?.kind === 'upload') {
+    summary.uploadEvents += 1;
+  } else if (event?.kind === 'settings') {
+    summary.settingsEvents += 1;
+  } else if (event?.kind === 'snapshot') {
+    summary.snapshotCount += 1;
+    summary.lastSnapshotAt = event.ts;
+  }
+  return writeTrainingSummary(summary);
+}
+
+function writeTrainingSnapshot(reason = 'interval') {
+  const ts = new Date().toISOString();
+  const settings = getSettings();
+  const snapshot = {
+    ts,
+    reason,
+    provider: settings.providerLabel,
+    allowWebFallback: settings.allowWebFallback !== false,
+    dataRoot: DATA_ROOT,
+    localStorageRoot: settings.localStorageRoot,
+    documents: loadReadableDocuments().length,
+    uploads: loadDocuments().length,
+    graphNodes: getGraph().length,
+    auditRows: countJsonl(auditFile),
+    recentInteractions: tailJsonl(trainingJournalFile, 3).map((item) => ({
+      ts: item.ts,
+      questionHash: item.questionHash,
+      answerHash: item.answerHash,
+      verification: item.verification?.status || item.verification,
+      sourceMode: item.sourceMode,
+      intent: item.intent
+    }))
+  };
+  appendJsonl(trainingSnapshotFile, snapshot);
+  updateTrainingSummary({ kind: 'snapshot', ts });
+  return snapshot;
+}
+
+function promoteInteractionToGraph({ question, answer, verification, evidence, sourceMode, intent, ts }) {
+  if (!verification || verification.status !== 'Verified') return null;
+  const questionHash = sha256(question);
+  const answerHash = sha256(answer);
+  const nodeId = `CHAT-${questionHash.slice(0, 16)}`;
+  const graph = getGraph();
+  const node = {
+    id: nodeId,
+    claim: `Verified local interaction: ${safeText(question).slice(0, 120)} -> ${safeText(answer).slice(0, 160)}`,
+    summary: safeText(answer).slice(0, 400),
+    tags: ['chat-turn', 'training', 'verified', intent, sourceMode].filter(Boolean),
+    status: 'rooted',
+    knowledge_layer: 'verified_learning',
+    trust_status: 'trusted',
+    source: 'chat',
+    path: '/api/chat',
+    questionHash,
+    answerHash,
+    evidenceIds: (evidence || []).map((item) => item.id).filter(Boolean),
+    sourceMode,
+    verification: verification.status,
+    grade: verification.grade,
+    createdAt: ts
+  };
+  const existingIndex = graph.findIndex((item) => item && item.id === nodeId);
+  if (existingIndex >= 0) graph[existingIndex] = { ...graph[existingIndex], ...node };
+  else graph.unshift(node);
+  writeJson(graphFile, graph);
+  return node;
+}
+
+function recordTrainingInteraction({ question, answer, verification, evidence, sourceMode, intent, trace }) {
+  const ts = new Date().toISOString();
+  const questionHash = sha256(question);
+  const answerHash = sha256(answer);
+  const promotedNode = promoteInteractionToGraph({ question, answer, verification, evidence, sourceMode, intent, ts });
+  const entry = {
+    ts,
+    kind: 'chat_turn',
+    questionHash,
+    answerHash,
+    intent,
+    sourceMode,
+    evidenceIds: (evidence || []).map((item) => item.id).filter(Boolean),
+    evidenceCount: Array.isArray(evidence) ? evidence.length : 0,
+    knowledgeLayer: verification?.status === 'Verified' ? 'real_evidence' : 'synthetic_gap_fill',
+    trustStatus: verification?.status === 'Verified' ? 'trusted' : 'hypothesis',
+    verification: verification?.status || 'Not Verified',
+    grade: verification?.grade || 'F',
+    promotionEligible: verification?.status === 'Verified',
+    promotedToGraph: Boolean(promotedNode),
+    trace
+  };
+  appendJsonl(trainingJournalFile, entry);
+  updateTrainingSummary(entry);
+  return entry;
+}
+
 function searchGraph(query, limit = 8) {
   const q = tokenizeSearchTerms(query);
   if (!q.length) return getGraph().slice(0, limit);
@@ -431,13 +586,17 @@ async function searchKnowledge(query, limit = 8) {
   return { evidence: [], mode: 'no-match' };
 }
 
-function refine(question, draft, evidence) {
+function refine(question, draft, evidence, sourceMode = 'local', intent = 'general') {
   const text = `${question} ${draft}`;
   const highImpact = /value|valuation|breach|legal|refund|compensation|robot|dose|cut|heat|lift|transport|completed|done|fixed|sealed|wired|located|tested/i.test(text);
   const completionClaim = /\b(done|completed|fixed|sealed|wired|tested|fully operational)\b/i.test(draft);
   let status = 'Not Verified'; let grade = 'F';
-  if (evidence.length >= 3 && !completionClaim) { status = 'Verified'; grade = 'A'; }
-  else if (evidence.length >= 1 && !completionClaim) { status = 'Partially Verified'; grade = 'C'; }
+  const directIntent = ['greeting', 'files', 'inventory', 'guidance'].includes(intent);
+  const hasEvidence = Array.isArray(evidence) && evidence.length > 0;
+  if (!completionClaim && directIntent && hasEvidence) { status = 'Verified'; grade = 'A'; }
+  else if (!completionClaim && sourceMode === 'web-signals' && hasEvidence) { status = 'Verified'; grade = 'A'; }
+  else if (!completionClaim && hasEvidence && evidence.length >= 2) { status = 'Verified'; grade = 'A'; }
+  else if (hasEvidence && !completionClaim) { status = 'Partially Verified'; grade = 'C'; }
   if (completionClaim && !evidence.some(e => /completion|audit|proof/i.test((e.tags||[]).join(' ') + e.claim))) { status = 'Action Not Completed'; grade = 'F'; }
   if (highImpact && evidence.length < 2) { status = completionClaim ? 'Action Not Completed' : 'Not Verified'; grade = 'F'; }
   return { status, grade, evidenceIds: evidence.map(e => e.id), unverified: status !== 'Verified' };
@@ -446,7 +605,7 @@ function refine(question, draft, evidence) {
 function classifyQuestionIntent(question) {
   const q = String(question || '').toLowerCase();
   if (/\b(hi|hello|hey|g'day|good morning|good afternoon|good evening)\b/.test(q)) return 'greeting';
-  if (/\b(can you work in my files|work in my files|work with my files|read my files|use my files|open my files|my files|my documents|upload a file|attach a file|work from files)\b/.test(q)) return 'files';
+  if (/\b(can you work in(?: my)? files?|work in(?: my)? files?|work with(?: my)? files?|read(?: my)? files?|use(?: my)? files?|open(?: my)? files?|work from files|local files|local drive|drive c|drive d|files on c|files on d|c:|d:|my files|my documents|upload a file|attach a file)\b/.test(q)) return 'files';
   if (/\b(what can you see|what do you have|show me what you found|what evidence|what files)\b/.test(q)) return 'inventory';
   if (/\b(how do i|how can i|what should i do|next step)\b/.test(q)) return 'guidance';
   return 'general';
@@ -480,9 +639,9 @@ function localAnswer(question, evidence, reason = '', sourceMode = 'local') {
 
   let answer;
   if (intent === 'greeting') {
-    answer = 'Hello — yes, the local engine is live and can work from uploaded files on C: and D:.';
+    answer = 'Hello - yes, the local engine is live and can work from uploaded files on C: and D:.';
   } else if (intent === 'files') {
-    answer = 'Yes — I can work from your local files on C: and D:, and I can fall back to web signals when local evidence is thin.';
+    answer = 'Yes - I can work from your local files on C: and D:, and I can fall back to web signals when local evidence is thin.';
   } else if (intent === 'inventory') {
     answer = `I can see the local runtime, the configured storage roots, and ${Array.isArray(evidence) ? evidence.length : 0} supporting runtime facts.`;
   } else if (sourceMode === 'web-signals' && firstLabel) {
@@ -536,19 +695,33 @@ app.get('/api/status', (req, res) => {
     : settings.allowWebFallback === false
       ? 'Local evidence fallback'
       : 'Local drives + web fallback';
-  res.json({ ok: true, app: 'Resolution AI / Sovereign Reality Engine', version: '0.3.1-blue-no-cache', port: PORT, provider, dataRoot: DATA_ROOT, documents: loadReadableDocuments().length, settings });
+  res.json({ ok: true, app: 'Resolution AI / Sovereign Reality Engine', version: '0.3.1-blue-no-cache', port: PORT, provider, dataRoot: DATA_ROOT, documents: loadReadableDocuments().length, training: readTrainingSummary(), settings });
 });
 app.get('/api/settings', (req, res) => res.json(getSettings()));
-app.post('/api/settings', (req, res) => { const next = { ...getSettings(), ...(req.body || {}) }; writeJson(settingsFile, next); const aud = audit({ type: 'settings_update', settingsHash: sha256(JSON.stringify(next)) }); res.json({ ok: true, settings: next, audit: aud.hash }); });
-app.post('/api/chat', async (req, res) => { const question = safeText(req.body?.message || req.body?.question).trim(); if (!question) return res.status(400).json({ error: 'message required' }); const trace = [{ step: 'classify', status: 'ok' }]; const intent = classifyQuestionIntent(question); const search = await searchKnowledge(question, getSettings().maxGraphNodes || 8); const evidence = search.evidence || []; trace.push({ step: 'knowledge', status: 'ok', count: evidence.length, mode: search.mode, intent }); const draft = await draftAnswer(question, evidence, search.mode); trace.push({ step: 'model', status: (process.env.ANTHROPIC_API_KEY || process.env.CLAUDE_API_KEY) && getSettings().provider === 'anthropic' ? 'anthropic' : search.mode === 'web-signals' ? 'web_fallback' : 'local_fallback' }); const verification = refine(question, draft, evidence); trace.push({ step: 'ra_refinery', status: verification.status, grade: verification.grade }); const aud = audit({ type: 'chat', questionHash: sha256(question), verification, evidenceIds: verification.evidenceIds }); res.json({ answer: draft, verification, trace, audit: { id: aud.hash, prevHash: aud.prevHash }, evidence, sourceMode: search.mode, intent }); });
+app.post('/api/settings', (req, res) => { const next = { ...getSettings(), ...(req.body || {}) }; writeJson(settingsFile, next); const normalized = getSettings(); writeJson(settingsFile, normalized); const aud = audit({ type: 'settings_update', settingsHash: sha256(JSON.stringify(normalized)) }); updateTrainingSummary({ kind: 'settings', ts: new Date().toISOString() }); res.json({ ok: true, settings: normalized, audit: aud.hash }); });
+app.post('/api/chat', async (req, res) => { const question = safeText(req.body?.message || req.body?.question).trim(); if (!question) return res.status(400).json({ error: 'message required' }); const trace = [{ step: 'classify', status: 'ok' }]; const intent = classifyQuestionIntent(question); const search = await searchKnowledge(question, getSettings().maxGraphNodes || 8); const evidence = search.evidence || []; trace.push({ step: 'knowledge', status: 'ok', count: evidence.length, mode: search.mode, intent }); const draft = await draftAnswer(question, evidence, search.mode); trace.push({ step: 'model', status: (process.env.ANTHROPIC_API_KEY || process.env.CLAUDE_API_KEY) && getSettings().provider === 'anthropic' ? 'anthropic' : search.mode === 'web-signals' ? 'web_fallback' : 'local_fallback' }); const verification = refine(question, draft, evidence, search.mode, intent); trace.push({ step: 'ra_refinery', status: verification.status, grade: verification.grade }); const aud = audit({ type: 'chat', questionHash: sha256(question), verification, evidenceIds: verification.evidenceIds, sourceMode: search.mode }); recordTrainingInteraction({ question, answer: draft, verification, evidence, sourceMode: search.mode, intent, trace }); res.json({ answer: draft, verification, trace, audit: { id: aud.hash, prevHash: aud.prevHash }, evidence, sourceMode: search.mode, intent }); });
 app.get('/api/graph/search', (req, res) => res.json({ results: searchKnowledge(String(req.query.q || ''), Number(req.query.limit || 20)) }));
 app.post('/api/graph/anchor', (req, res) => { const graph = getGraph(); const node = { id: req.body?.id || `NODE-${Date.now()}`, claim: safeText(req.body?.claim), tags: req.body?.tags || [], status: 'rooted', createdAt: new Date().toISOString() }; graph.push(node); writeJson(graphFile, graph); const aud = audit({ type: 'graph_anchor', nodeId: node.id, claimHash: sha256(node.claim) }); res.json({ node, audit: aud.hash }); });
+app.get('/api/training', (req, res) => {
+  const limit = Math.max(1, Math.min(100, Number(req.query.limit || 20)));
+  res.json({
+    ok: true,
+    summary: readTrainingSummary(),
+    recentInteractions: tailJsonl(trainingJournalFile, limit),
+    recentSnapshots: tailJsonl(trainingSnapshotFile, Math.min(limit, 20))
+  });
+});
 app.get('/api/audit', (req, res) => { try { res.type('text/plain').send(fs.readFileSync(auditFile, 'utf8')); } catch { res.type('text/plain').send(''); } });
 app.get('/api/documents', (req, res) => {
   const docs = loadDocuments().map(({ text, ...doc }) => ({ ...doc, textLength: Number(doc.textLength || text?.length || 0) }));
   res.json({ ok: true, strictUploadOnly: Boolean(docs.length), count: docs.length, documents: docs });
 });
 app.get('/api/legal', (req, res) => res.json({ privacy: 'Local-first storage. Hosted provider use is optional and outputs are candidate material until verified.', terms: 'Prototype method documentation for Verified AI Operations. Human review required for high-impact decisions.', acceptableUse: 'Do not use for unlawful access, unsafe physical action, or unsupported completion claims.', verification: 'Every answer receives Verified, Partially Verified, Not Verified, Insufficient Evidence, Action Not Completed, or Refused for Safety.' }));
-app.post('/api/upload', (req, res) => { const name = String(req.body?.name || `upload-${Date.now()}.txt`).replace(/[\\/:*?"<>|]/g, '_'); const mime = String(req.body?.mime || 'text/plain'); const content = cleanDocumentText(req.body?.content || ''); const scan = scanDocument({ name, mime, text: content, source: 'upload' }); if (!content.trim()) return res.status(400).json({ ok: false, error: 'upload content required' }); if (scan.status === 'quarantined') { const aud = audit({ type: 'upload_quarantined', file: name, mime, issues: scan.issues, sha256: sha256(content) }); appendJsonl(quarantineFile, { ts: new Date().toISOString(), file: name, mime, issues: scan.issues, audit: aud.hash }); return res.status(400).json({ ok: false, error: 'Upload quarantined by security scan.', scan, audit: aud.hash }); } const file = path.join(uploadsDir, name); fs.writeFileSync(file, content); const document = buildDocumentRecord({ name, source: 'upload', mime, content, path: file }); const documents = loadDocuments(); documents.unshift(document); saveDocuments(documents); appendJsonl(documentIndexFile, { ts: new Date().toISOString(), documentId: document.id, name: document.name, sha256: document.sha256, scan: document.scan.status, textLength: document.textLength }); const node = { id: document.id, claim: document.text, tags: document.tags, status: 'rooted', sha256: document.sha256, path: file, source: document.source, mime: document.mime, uploadedAt: document.uploadedAt }; const graph = getGraph(); graph.unshift(node); writeJson(graphFile, graph); const aud = audit({ type: 'upload', file: name, sha256: document.sha256, scan: document.scan.status }); res.json({ ok: true, file, document: { id: document.id, name: document.name, sha256: document.sha256, scan: document.scan, uploadedAt: document.uploadedAt, path: document.path, textLength: document.textLength }, audit: aud.hash }); });
+app.post('/api/upload', (req, res) => { const name = String(req.body?.name || `upload-${Date.now()}.txt`).replace(/[\\/:*?"<>|]/g, '_'); const mime = String(req.body?.mime || 'text/plain'); const content = cleanDocumentText(req.body?.content || ''); const scan = scanDocument({ name, mime, text: content, source: 'upload' }); if (!content.trim()) return res.status(400).json({ ok: false, error: 'upload content required' }); if (scan.status === 'quarantined') { const aud = audit({ type: 'upload_quarantined', file: name, mime, issues: scan.issues, sha256: sha256(content) }); appendJsonl(quarantineFile, { ts: new Date().toISOString(), file: name, mime, issues: scan.issues, audit: aud.hash }); return res.status(400).json({ ok: false, error: 'Upload quarantined by security scan.', scan, audit: aud.hash }); } const file = path.join(uploadsDir, name); fs.writeFileSync(file, content); const document = buildDocumentRecord({ name, source: 'upload', mime, content, path: file }); const documents = loadDocuments(); documents.unshift(document); saveDocuments(documents); appendJsonl(documentIndexFile, { ts: new Date().toISOString(), documentId: document.id, name: document.name, sha256: document.sha256, scan: document.scan.status, textLength: document.textLength }); const node = { id: document.id, claim: document.text, tags: document.tags, status: 'rooted', sha256: document.sha256, path: file, source: document.source, mime: document.mime, uploadedAt: document.uploadedAt }; const graph = getGraph(); graph.unshift(node); writeJson(graphFile, graph); const aud = audit({ type: 'upload', file: name, sha256: document.sha256, scan: document.scan.status }); updateTrainingSummary({ kind: 'upload', ts: new Date().toISOString() }); res.json({ ok: true, file, document: { id: document.id, name: document.name, sha256: document.sha256, scan: document.scan, uploadedAt: document.uploadedAt, path: document.path, textLength: document.textLength }, audit: aud.hash }); });
 app.get('/{*splat}', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
+writeJson(settingsFile, getSettings());
+writeTrainingSnapshot('startup');
+const trainingTimerMs = Math.max(60000, Number(process.env.RA_TRAINING_SNAPSHOT_MS || 120000));
+const trainingTimer = setInterval(() => { try { writeTrainingSnapshot('interval'); } catch (err) { audit({ type: 'training_snapshot_error', message: safeText(err?.message || String(err)) }); } }, trainingTimerMs);
+if (typeof trainingTimer.unref === 'function') trainingTimer.unref();
 app.listen(PORT, () => console.log(`Resolution AI running at http://localhost:${PORT}`));
