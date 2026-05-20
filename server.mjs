@@ -18,6 +18,12 @@ app.use((req, res, next) => {
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
   res.setHeader('Pragma', 'no-cache');
   res.setHeader('Expires', '0');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(204);
+  }
   next();
 });
 app.use(express.json({ limit: '30mb' }));
@@ -215,7 +221,7 @@ function getGraph() {
 }
 
 function getSettings() {
-  const defaults = { theme: 'resolution_assurance_blue', provider: 'anthropic', providerLabel: 'Claude', fallbackProvider: 'ollama', retrievalBudgetMs: 1800, modelTimeoutMs: 8000, stream: true, localStorageRoot: DATA_ROOT, allowUnverifiedAnswer: true, blockFalseCompletion: true, fastMode: true };
+  const defaults = { theme: 'resolution_assurance_blue', provider: 'local', providerLabel: 'Local evidence fallback', fallbackProvider: 'local', retrievalBudgetMs: 1800, modelTimeoutMs: 8000, stream: true, localStorageRoot: DATA_ROOT, allowUnverifiedAnswer: true, blockFalseCompletion: true, fastMode: true };
   return { ...defaults, ...readJson(settingsFile, {}) };
 }
 
@@ -264,9 +270,21 @@ async function claudeAnswer(question, evidence) {
   } catch (err) { return localAnswer(question, evidence, `Claude timed out or failed (${err.name || 'error'}). Falling back locally.`); }
   finally { clearTimeout(timeout); }
 }
-async function draftAnswer(question, evidence) { return await claudeAnswer(question, evidence) || localAnswer(question, evidence); }
+async function draftAnswer(question, evidence) {
+  const settings = getSettings();
+  if (settings.provider === 'anthropic') {
+    return await claudeAnswer(question, evidence) || localAnswer(question, evidence, 'Claude was unavailable, so I fell back locally.');
+  }
+  return localAnswer(question, evidence);
+}
 
-app.get('/api/status', (req, res) => res.json({ ok: true, app: 'Resolution AI / Sovereign Reality Engine', version: '0.3.1-blue-no-cache', port: PORT, provider: (process.env.ANTHROPIC_API_KEY || process.env.CLAUDE_API_KEY) ? 'Claude / Anthropic' : 'Local evidence fallback', dataRoot: DATA_ROOT, documents: loadReadableDocuments().length, settings: getSettings() }));
+app.get('/api/status', (req, res) => {
+  const settings = getSettings();
+  const provider = settings.provider === 'anthropic' && (process.env.ANTHROPIC_API_KEY || process.env.CLAUDE_API_KEY)
+    ? 'Claude / Anthropic'
+    : 'Local evidence fallback';
+  res.json({ ok: true, app: 'Resolution AI / Sovereign Reality Engine', version: '0.3.1-blue-no-cache', port: PORT, provider, dataRoot: DATA_ROOT, documents: loadReadableDocuments().length, settings });
+});
 app.get('/api/settings', (req, res) => res.json(getSettings()));
 app.post('/api/settings', (req, res) => { const next = { ...getSettings(), ...(req.body || {}) }; writeJson(settingsFile, next); const aud = audit({ type: 'settings_update', settingsHash: sha256(JSON.stringify(next)) }); res.json({ ok: true, settings: next, audit: aud.hash }); });
 app.post('/api/chat', async (req, res) => { const question = safeText(req.body?.message || req.body?.question).trim(); if (!question) return res.status(400).json({ error: 'message required' }); const trace = [{ step: 'classify', status: 'ok' }]; const evidence = searchKnowledge(question, getSettings().maxGraphNodes || 8); trace.push({ step: 'knowledge', status: 'ok', count: evidence.length, mode: loadReadableDocuments().length ? 'uploaded-documents' : 'seed-graph' }); const draft = await draftAnswer(question, evidence); trace.push({ step: 'model', status: (process.env.ANTHROPIC_API_KEY || process.env.CLAUDE_API_KEY) ? 'claude_or_fallback' : 'local_fallback' }); const verification = refine(question, draft, evidence); trace.push({ step: 'ra_refinery', status: verification.status, grade: verification.grade }); const aud = audit({ type: 'chat', questionHash: sha256(question), verification, evidenceIds: verification.evidenceIds }); res.json({ answer: draft, verification, trace, audit: { id: aud.hash, prevHash: aud.prevHash }, evidence }); });

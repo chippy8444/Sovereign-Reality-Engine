@@ -20,7 +20,7 @@
     <button class="navbtn" onclick="showPanel('settings',this); loadSettings()">Settings</button>
     <button class="navbtn" onclick="testProvider()">Test Provider</button>
     <button class="navbtn" onclick="clearCacheReload()">Force Blue Reload</button>
-    <div class="side-status" id="sideStatus"><b>Privacy:</b> local-first storage.<br><b>Provider:</b> Claude first, local fallback.<br><b>Rule:</b> answer + badge.</div>
+    <div class="side-status" id="sideStatus"><b>Privacy:</b> local-first storage.<br><b>Provider:</b> local evidence fallback by default.<br><b>Rule:</b> answer + badge.</div>
   </aside>
   <main class="main">
     <header class="top"><b id="title">Resolution AI</b><span class="provider" id="status">Checking…</span></header>
@@ -30,7 +30,7 @@
         <div id="graphPanel" class="panel"><h2>Evidence Graph</h2><div class="card"><input id="graphQ" placeholder="Search graph…" onkeydown="if(event.key==='Enter')loadGraph()" style="width:100%;border:1px solid var(--border);border-radius:12px;padding:10px"><pre id="graphOut">Loading…</pre></div></div>
         <div id="auditPanel" class="panel"><h2>Audit Log</h2><div class="card"><pre id="auditOut">Loading…</pre></div></div>
         <div id="legalPanel" class="panel"><h2>Privacy / Legal</h2><div class="card"><pre id="legalOut">Loading…</pre></div></div>
-        <div id="settingsPanel" class="panel"><h2>Settings</h2><div class="card grid"><label class="field">Provider<select id="provider"><option value="anthropic">Claude / Anthropic</option><option value="ollama">Ollama local</option></select></label><label class="field">Retrieval budget ms<input id="budget" type="number" value="1800"></label><label class="field">Theme<input value="resolution_assurance_blue" disabled></label><label class="field">Storage root<input id="storage" disabled></label></div><button class="send" onclick="saveSettings()">Save Settings</button><pre id="settingsOut"></pre></div>
+        <div id="settingsPanel" class="panel"><h2>Settings</h2><div class="card grid"><label class="field">Provider<select id="provider"><option value="local">Local evidence fallback</option><option value="anthropic">Claude / Anthropic</option></select></label><label class="field">Retrieval budget ms<input id="budget" type="number" value="1800"></label><label class="field">Theme<input value="resolution_assurance_blue" disabled></label><label class="field">Storage root<input id="storage" disabled></label></div><button class="send" onclick="saveSettings()">Save Settings</button><pre id="settingsOut"></pre></div>
       </div>
     </section>
     <div class="composer"><div class="bar"><input id="file" class="fileinput" type="file" onchange="attachFile(this.files[0])"><button class="icon" onclick="document.getElementById('file').click()" title="Attach">＋</button><button class="icon" onclick="mic()" title="Microphone">🎙</button><textarea id="input" placeholder="Message Resolution AI…" rows="1"></textarea><button class="send" onclick="send()">Send</button></div></div>
@@ -49,7 +49,7 @@ async function send(){showPanel('chat',document.querySelector('.navbtn'));const 
 async function loadGraph(){try{const q=encodeURIComponent($('graphQ')?.value||'');const j=await api('/api/graph/search?q='+q+'&limit=50');$('graphOut').textContent=JSON.stringify(j,null,2)}catch(e){$('graphOut').textContent=e.message}}
 async function loadAudit(){try{$('auditOut').textContent=await api('/api/audit')}catch(e){$('auditOut').textContent=e.message}}
 async function loadLegal(){try{$('legalOut').textContent=JSON.stringify(await api('/api/legal'),null,2)}catch(e){$('legalOut').textContent=e.message}}
-async function loadSettings(){try{const j=await api('/api/settings');$('provider').value=j.provider||'anthropic';$('budget').value=j.retrievalBudgetMs||1800;$('storage').value=j.localStorageRoot||'';$('settingsOut').textContent=JSON.stringify(j,null,2)}catch(e){$('settingsOut').textContent=e.message}}
+async function loadSettings(){try{const j=await api('/api/settings');$('provider').value=j.provider||'local';$('budget').value=j.retrievalBudgetMs||1800;$('storage').value=j.localStorageRoot||'';$('settingsOut').textContent=JSON.stringify(j,null,2)}catch(e){$('settingsOut').textContent=e.message}}
 async function saveSettings(){try{const j=await api('/api/settings',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({provider:$('provider').value,retrievalBudgetMs:Number($('budget').value),theme:'resolution_assurance_blue'})});$('settingsOut').textContent=JSON.stringify(j,null,2);status()}catch(e){$('settingsOut').textContent=e.message}}
 async function testProvider(){showPanel('chat',document.querySelector('.navbtn'));input.value='Provider test: reply with one sentence and verification badge.';await send()}
 async function attachFile(file){if(!file)return;const text=await file.text().catch(()=>null);if(text==null){add('ai','Attachment could not be read as text.',{status:'Not Verified',grade:'F'});return}try{const j=await api('/api/upload',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({name:file.name,content:text})});add('ai','Attached and anchored locally: '+file.name,{status:'Partially Verified',grade:'C'},[{step:'upload',status:'ok'}])}catch(e){add('ai','Upload failed: '+e.message,{status:'Not Verified',grade:'F'})}}
