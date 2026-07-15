@@ -1,6 +1,6 @@
 {
   "schema_version": "ra.edge_export_summary.v1",
-  "generated_time_utc": "2026-07-15T13:55:21Z",
+  "generated_time_utc": "2026-07-15T19:20:28Z",
   "source_node": "sovereign-reality-engine",
   "target_graph": "resolution-assurance-protocol/data/graph",
   "packet_count": 6,
@@ -8,5 +8,5 @@
   "last_audit_hash": null,
   "privacy": "metadata_only",
   "raw_private_data_moved": false,
-  "export_hash_sha256": "333f1609c7fcfe6d7f883194f35fcbc27441aadfe00cc9e0ce646c2e4768a482"
+  "export_hash_sha256": "51d1a884b9f11de63cef60f36a0bcc3de12772b92b941c20a2b339a57e2b9bf3"
 }
